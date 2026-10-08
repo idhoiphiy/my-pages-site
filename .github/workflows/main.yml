@@ -1,0 +1,236 @@
+name: Windows Utility Runner (6 Hours)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  runner-job:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    strategy:
+      max-parallel: 5
+      matrix:
+        node:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+
+    steps:
+      - name: Startup Delay
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds (Get-Random -Minimum 10 -Maximum 40)
+
+      - name: Prepare RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          try {
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+            Write-Host "RDP configuration completed."
+          }
+          catch {
+            Write-Warning "RDP configuration warning: $($_.Exception.Message)"
+          }
+
+      - name: Create User
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "user$env:GITHUB_RUN_NUMBER"
+
+          $chars = ([char[]](48..57 + 65..90 + 97..122))
+          $password = -join (1..16 | ForEach-Object {
+            $chars | Get-Random
+          })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          try {
+            $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+            if (-not $existingUser) {
+              New-LocalUser -Name $username -Password $securePass -PasswordNeverExpires -AccountNeverExpires
+            }
+
+            Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+
+            Write-Host "User created: $username"
+          }
+          catch {
+            Write-Warning "User setup warning: $($_.Exception.Message)"
+          }
+
+          "R_USER=$username" >> $env:GITHUB_ENV
+          "R_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = "$env:TEMP\tailscale-setup.msi"
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+
+          $downloaded = $false
+
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              Write-Host "Downloading Tailscale - Attempt $i"
+
+              Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+
+              if (Test-Path $installer) {
+                $downloaded = $true
+                break
+              }
+            }
+            catch {
+              Write-Warning "Download failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds (10 * $i)
+            }
+          }
+
+          if (-not $downloaded) {
+            Write-Error "Failed to download Tailscale."
+            exit 1
+          }
+
+          $process = Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait -PassThru
+
+          if ($process.ExitCode -ne 0) {
+            Write-Error "Tailscale installation failed. Exit code: $($process.ExitCode)"
+            exit 1
+          }
+
+          Write-Host "Tailscale installation completed."
+
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+            Write-Error "Tailscale executable not found."
+            exit 1
+          }
+
+          $node = "${{ matrix.node }}"
+          $hostname = "node$env:GITHUB_RUN_ID$node"
+
+          Write-Host "Node: $node"
+          Write-Host "Hostname: $hostname"
+
+          Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+
+          $success = $false
+
+          for ($i = 1; $i -le 5; $i++) {
+            Write-Host "Tailscale connection attempt $i of 5"
+
+            try {
+              & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --reset
+
+              Start-Sleep -Seconds 10
+
+              $status = & $ts status 2>&1 | Out-String
+
+              Write-Host $status
+
+              if ($status -notmatch "NeedsLogin") {
+                $success = $true
+                break
+              }
+            }
+            catch {
+              Write-Warning "Tailscale attempt failed: $($_.Exception.Message)"
+            }
+
+            Start-Sleep -Seconds (10 * $i)
+          }
+
+          if (-not $success) {
+            Write-Error "Tailscale login failed."
+            exit 1
+          }
+
+          $ip = ""
+
+          for ($i = 1; $i -le 10; $i++) {
+            Write-Host "Waiting for Tailscale IPv4 address..."
+
+            try {
+              $ip = (& $ts ip -4 2>$null | Select-Object -First 1).Trim()
+            }
+            catch {
+              $ip = ""
+            }
+
+            if ($ip -and $ip -match "^\d+\.\d+\.\d+\.\d+$") {
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $ip) {
+            Write-Error "No Tailscale IPv4 address available."
+            exit 1
+          }
+
+          Write-Host "Tailscale IPv4: $ip"
+
+          "R_HOST=$ip" >> $env:GITHUB_ENV
+
+      - name: Show Info
+        shell: powershell
+        run: |
+          Write-Host "=== ACCESS INFO ==="
+          Write-Host "Host : $env:R_HOST"
+          Write-Host "User : $env:R_USER"
+          Write-Host "Pass : $env:R_PASS"
+          Write-Host "Node : ${{ matrix.node }}"
+          Write-Host "==================="
+
+      - name: Active Session (6 Hours)
+        shell: powershell
+        run: |
+          $end = (Get-Date).AddMinutes(360)
+
+          Write-Host "Session started: $(Get-Date)"
+          Write-Host "Session ends approximately: $end"
+
+          while ((Get-Date) -lt $end) {
+            Get-Process | Out-Null
+
+            $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+            if (Test-Path $ts) {
+              try {
+                $status = & $ts status 2>&1 | Out-String
+
+                if ($status -match "NeedsLogin") {
+                  Write-Warning "Tailscale requires login."
+                }
+                else {
+                  Write-Host "Tailscale status OK - $(Get-Date)"
+                }
+              }
+              catch {
+                Write-Warning "Could not check Tailscale status."
+              }
+            }
+
+            Start-Sleep -Seconds (Get-Random -Minimum 120 -Maximum 300)
+          }
+
+          Write-Host "6-hour session completed."
